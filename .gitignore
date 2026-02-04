@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.netrc
+credentials.json
+
+# Data (downloaded at runtime or by scripts, not committed)
+data/gtfs/
+data/srtm/
+data/trails/
+
+# Keep the processed index (committed by GitHub Action)
+!data/processed/
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/trail_index.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/

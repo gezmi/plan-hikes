@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Israel Hiking Transit Planner</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Left panel: query form + results -->
+    <div id="sidebar">
+      <h1>Israel Hiking Planner</h1>
+      <form id="query-form">
+        <div class="form-group">
+          <label for="origins">Origin cities</label>
+          <select id="origins" multiple></select>
+        </div>
+        <div class="form-group">
+          <label for="date">Date</label>
+          <input type="date" id="date" required />
+        </div>
+        <details class="filters-section">
+          <summary>Filters</summary>
+          <div class="form-group">
+            <label for="max-results">Max results</label>
+            <input type="number" id="max-results" value="10" min="1" max="50" />
+          </div>
+          <div class="form-group">
+            <label for="min-hike">Min hiking hours</label>
+            <input type="number" id="min-hike" value="1.0" min="0" step="0.5" />
+          </div>
+          <div class="form-group">
+            <label for="max-walk">Max walk to trail (m)</label>
+            <input type="number" id="max-walk" value="1000" min="100" step="100" />
+          </div>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="min-distance">Min distance (km)</label>
+              <input type="number" id="min-distance" min="0" step="0.5" />
+            </div>
+            <div class="form-group half">
+              <label for="max-distance">Max distance (km)</label>
+              <input type="number" id="max-distance" min="0" step="0.5" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="max-elevation">Max elevation gain (m)</label>
+            <input type="number" id="max-elevation" min="0" step="50" />
+          </div>
+          <div class="form-group">
+            <label>Trail colors</label>
+            <div class="color-chips">
+              <label class="chip red"><input type="checkbox" value="red" /> Red</label>
+              <label class="chip blue"><input type="checkbox" value="blue" /> Blue</label>
+              <label class="chip green"><input type="checkbox" value="green" /> Green</label>
+              <label class="chip black"><input type="checkbox" value="black" /> Black</label>
+              <label class="chip orange"><input type="checkbox" value="orange" /> Orange</label>
+              <label class="chip purple"><input type="checkbox" value="purple" /> Purple</label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Trail type</label>
+            <div class="radio-group">
+              <label><input type="radio" name="trail-type" value="any" checked /> Any</label>
+              <label><input type="radio" name="trail-type" value="loop" /> Loop only</label>
+              <label><input type="radio" name="trail-type" value="linear" /> Linear only</label>
+            </div>
+          </div>
+        </details>
+        <button type="submit" id="search-btn">Search Hikes</button>
+      </form>
+      <div id="status"></div>
+      <div id="results"></div>
+    </div>
+
+    <!-- Right panel: map -->
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

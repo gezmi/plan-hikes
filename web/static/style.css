@@ -1,0 +1,333 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  color: #1a1a2e;
+  background: #f5f5f5;
+}
+
+#app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────── */
+
+#sidebar {
+  width: 420px;
+  min-width: 420px;
+  height: 100vh;
+  overflow-y: auto;
+  background: #fff;
+  border-right: 1px solid #e0e0e0;
+  padding: 20px;
+}
+
+h1 {
+  font-size: 1.3em;
+  margin-bottom: 16px;
+  color: #16213e;
+}
+
+/* ── Form ─────────────────────────────────────────────────────── */
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #555;
+  margin-bottom: 4px;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 0.9em;
+}
+
+.form-group select[multiple] {
+  height: 80px;
+}
+
+.form-row {
+  display: flex;
+  gap: 10px;
+}
+
+.form-group.half {
+  flex: 1;
+}
+
+.filters-section {
+  margin-bottom: 12px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.filters-section summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85em;
+  color: #555;
+}
+
+.filters-section[open] summary {
+  margin-bottom: 10px;
+}
+
+/* Color chips */
+.color-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 0.8em;
+  cursor: pointer;
+  border: 1px solid #ddd;
+  background: #f9f9f9;
+}
+
+.chip input { display: none; }
+.chip.red:has(input:checked)    { background: #f44336; color: #fff; border-color: #f44336; }
+.chip.blue:has(input:checked)   { background: #2196f3; color: #fff; border-color: #2196f3; }
+.chip.green:has(input:checked)  { background: #4caf50; color: #fff; border-color: #4caf50; }
+.chip.black:has(input:checked)  { background: #333;    color: #fff; border-color: #333; }
+.chip.orange:has(input:checked) { background: #ff9800; color: #fff; border-color: #ff9800; }
+.chip.purple:has(input:checked) { background: #9c27b0; color: #fff; border-color: #9c27b0; }
+
+.radio-group {
+  display: flex;
+  gap: 12px;
+  font-size: 0.85em;
+}
+
+.radio-group label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: normal;
+}
+
+/* Search button */
+#search-btn {
+  width: 100%;
+  padding: 10px;
+  background: #0f3460;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 1em;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+#search-btn:hover { background: #16213e; }
+#search-btn:disabled { background: #999; cursor: wait; }
+
+/* ── Status ───────────────────────────────────────────────────── */
+
+#status {
+  margin-top: 12px;
+  font-size: 0.85em;
+  color: #666;
+}
+
+#status.error {
+  color: #d32f2f;
+  font-weight: 600;
+}
+
+/* ── Results ──────────────────────────────────────────────────── */
+
+#results {
+  margin-top: 16px;
+}
+
+.origin-header {
+  font-size: 1.05em;
+  font-weight: 700;
+  color: #0f3460;
+  margin: 16px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 2px solid #0f3460;
+}
+
+.plan-card {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  background: #fff;
+  overflow: hidden;
+  cursor: pointer;
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+
+.plan-card:hover, .plan-card.active {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  border-color: #0f3460;
+}
+
+.plan-card.active {
+  border-color: #2196f3;
+  border-width: 2px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: #fafafa;
+  border-bottom: 1px solid #eee;
+}
+
+.card-header .rank {
+  font-weight: 700;
+  color: #0f3460;
+  margin-right: 8px;
+}
+
+.card-header .trail-name {
+  font-weight: 600;
+  flex: 1;
+}
+
+.card-header .ratio-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.8em;
+  font-weight: 700;
+  color: #fff;
+}
+
+.ratio-high   { background: #4caf50; }
+.ratio-medium { background: #ff9800; }
+.ratio-low    { background: #f44336; }
+
+.card-body {
+  padding: 10px 12px;
+  font-size: 0.85em;
+  line-height: 1.6;
+}
+
+.card-body .info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-body .label {
+  color: #888;
+  font-size: 0.8em;
+}
+
+.color-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+
+.card-details {
+  display: none;
+  padding: 0 12px 12px;
+  font-size: 0.82em;
+  line-height: 1.7;
+}
+
+.plan-card.active .card-details { display: block; }
+
+.leg-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.leg-row .bus-badge {
+  background: #e3f2fd;
+  color: #0f3460;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 0.85em;
+}
+
+.section-label {
+  font-weight: 700;
+  margin-top: 8px;
+  margin-bottom: 2px;
+}
+
+.section-label.outbound { color: #1976d2; }
+.section-label.hiking   { color: #388e3c; }
+.section-label.return   { color: #1976d2; }
+
+.warning-row {
+  color: #e65100;
+  font-weight: 600;
+}
+
+.links-row a {
+  color: #1976d2;
+  text-decoration: none;
+  margin-right: 10px;
+  font-size: 0.85em;
+}
+
+.links-row a:hover { text-decoration: underline; }
+
+.elevation-spark {
+  font-family: monospace;
+  font-size: 0.9em;
+  letter-spacing: 0;
+  color: #555;
+}
+
+.elev-label {
+  color: #999;
+  font-size: 0.8em;
+}
+
+/* ── Map ──────────────────────────────────────────────────────── */
+
+#map {
+  flex: 1;
+  height: 100vh;
+}
+
+/* ── Responsive ───────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  #app {
+    flex-direction: column;
+  }
+  #sidebar {
+    width: 100%;
+    min-width: unset;
+    height: auto;
+    max-height: 50vh;
+  }
+  #map {
+    height: 50vh;
+  }
+}
