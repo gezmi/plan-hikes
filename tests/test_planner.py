@@ -26,7 +26,13 @@ from src.models import (
     Trail,
     TrailAccessPoint,
 )
-from src.query.transit_router import TransitRouter, _time_to_seconds
+from src.query.transit_router import TransitRouter, TransitRouterDB, _time_to_seconds
+from src.ingest.gtfs import (
+    build_transit_db,
+    find_origin_stops_db,
+    _gtfs_time_to_seconds,
+    _get_active_service_ids_from_csv,
+)
 from src.query.planner import (
     PlannerContext,
     _resolve_origin,
@@ -1488,3 +1494,322 @@ class TestTrailIndex:
         path = self._make_index_file(tmp_path)
         trails = load_trail_index(path)
         assert trails[0].colors == ["red", "blue"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SQLite transit database
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _make_transit_db(tmp_path):
+    """Create a minimal transit SQLite database for testing."""
+    import sqlite3
+
+    db_path = tmp_path / "transit_test.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE stops (
+            stop_id TEXT PRIMARY KEY,
+            stop_name TEXT,
+            stop_lat REAL,
+            stop_lon REAL
+        );
+        CREATE TABLE routes (
+            route_id TEXT PRIMARY KEY,
+            short_name TEXT,
+            agency_name TEXT
+        );
+        CREATE TABLE trips (
+            trip_id TEXT PRIMARY KEY,
+            route_id TEXT
+        );
+        CREATE TABLE stop_times (
+            trip_id TEXT,
+            stop_id TEXT,
+            stop_sequence INTEGER,
+            arrival_secs INTEGER,
+            departure_secs INTEGER
+        );
+        CREATE INDEX idx_st_stop_dep ON stop_times(stop_id, departure_secs);
+        CREATE INDEX idx_st_trip_seq ON stop_times(trip_id, stop_sequence);
+    """)
+
+    # Same test data as the in-memory simple_feed fixture
+    conn.executemany("INSERT INTO stops VALUES (?,?,?,?)", [
+        ("A", "Origin", 31.8928, 34.8113),
+        ("B", "Mid", 31.85, 34.82),
+        ("C", "Trail", 31.80, 34.85),
+        ("D", "Other", 32.00, 35.00),
+    ])
+    conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
+        ("r1", "100", "Egged"),
+        ("r2", "200", "Egged"),
+    ])
+    conn.executemany("INSERT INTO trips VALUES (?,?)", [
+        ("t1", "r1"),
+        ("t2", "r2"),
+    ])
+    # Trip t1: A→B→C (outbound to trail), Trip t2: C→B→A (return)
+    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?)", [
+        ("t1", "A", 1, 25200, 25200),    # 07:00
+        ("t1", "B", 2, 27000, 27000),    # 07:30
+        ("t1", "C", 3, 28800, 28800),    # 08:00
+        ("t2", "C", 1, 54000, 54000),    # 15:00
+        ("t2", "B", 2, 55800, 55800),    # 15:30
+        ("t2", "A", 3, 57600, 57600),    # 16:00
+    ])
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestTransitRouterDB:
+    """Tests for the SQLite-backed transit router."""
+
+    def test_open_db(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        assert router.db_path == db_path
+        router.close()
+
+    def test_find_outbound_direct(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        legs = router.find_outbound(
+            origin_stops=["A"],
+            dest_stops={"C"},
+            earliest_departure_secs=6 * 3600,
+        )
+        assert legs is not None
+        assert len(legs) == 1
+        assert legs[0].line == "100"
+        assert legs[0].from_stop_id == "A"
+        assert legs[0].to_stop_id == "C"
+        router.close()
+
+    def test_find_return_direct(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        legs = router.find_return(
+            trail_stops=["C"],
+            origin_stops={"A"},
+            deadline_secs=18 * 3600,
+        )
+        assert legs is not None
+        assert len(legs) == 1
+        assert legs[0].line == "200"
+        assert legs[0].from_stop_id == "C"
+        assert legs[0].to_stop_id == "A"
+        router.close()
+
+    def test_no_route_found(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        legs = router.find_outbound(
+            origin_stops=["D"],
+            dest_stops={"C"},
+            earliest_departure_secs=6 * 3600,
+        )
+        assert legs is None
+        router.close()
+
+    def test_return_respects_deadline(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        legs = router.find_return(
+            trail_stops=["C"],
+            origin_stops={"A"},
+            deadline_secs=14 * 3600,
+        )
+        assert legs is None
+        router.close()
+
+
+class TestTransitRouterDBWithTransfer:
+    """Test 1-transfer routing via SQLite."""
+
+    def test_outbound_with_transfer(self, tmp_path):
+        """Route A→B (trip t1) + B→C (trip t3) with transfer at B."""
+        import sqlite3
+
+        db_path = tmp_path / "transfer.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE stops (stop_id TEXT PRIMARY KEY, stop_name TEXT, stop_lat REAL, stop_lon REAL);
+            CREATE TABLE routes (route_id TEXT PRIMARY KEY, short_name TEXT, agency_name TEXT);
+            CREATE TABLE trips (trip_id TEXT PRIMARY KEY, route_id TEXT);
+            CREATE TABLE stop_times (trip_id TEXT, stop_id TEXT, stop_sequence INTEGER,
+                                     arrival_secs INTEGER, departure_secs INTEGER);
+            CREATE INDEX idx_st_stop_dep ON stop_times(stop_id, departure_secs);
+            CREATE INDEX idx_st_trip_seq ON stop_times(trip_id, stop_sequence);
+        """)
+        conn.executemany("INSERT INTO stops VALUES (?,?,?,?)", [
+            ("A", "Origin", 0, 0), ("B", "Transfer", 0, 0), ("C", "Trail", 0, 0),
+        ])
+        conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
+            ("r1", "100", "Egged"), ("r3", "300", "Dan"),
+        ])
+        conn.executemany("INSERT INTO trips VALUES (?,?)", [
+            ("t1", "r1"), ("t3", "r3"),
+        ])
+        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?)", [
+            ("t1", "A", 1, 25200, 25200),   # 07:00
+            ("t1", "B", 2, 27000, 27000),   # 07:30
+            ("t3", "B", 1, 27120, 27120),   # 07:32 (transfer at B)
+            ("t3", "C", 2, 28800, 28800),   # 08:00
+        ])
+        conn.commit()
+        conn.close()
+
+        router = TransitRouterDB(db_path, datetime.date(2026, 2, 3))
+        legs = router.find_outbound(
+            origin_stops=["A"],
+            dest_stops={"C"},
+            earliest_departure_secs=6 * 3600,
+        )
+        assert legs is not None
+        assert len(legs) == 2
+        assert legs[0].line == "100"
+        assert legs[1].line == "300"
+        router.close()
+
+
+class TestBuildTransitDB:
+    """Tests for the GTFS→SQLite streaming builder."""
+
+    def test_gtfs_time_to_seconds(self):
+        assert _gtfs_time_to_seconds("07:30:00") == 27000
+        assert _gtfs_time_to_seconds("25:00:00") == 90000  # past midnight
+
+    def test_build_from_zip(self, tmp_path):
+        """Build a transit DB from a minimal GTFS zip."""
+        import zipfile
+
+        # Create a minimal GTFS zip
+        gtfs_zip = tmp_path / "test.zip"
+        with zipfile.ZipFile(gtfs_zip, "w") as zf:
+            zf.writestr("agency.txt", "agency_id,agency_name\nag1,Egged\n")
+            zf.writestr(
+                "calendar.txt",
+                "service_id,start_date,end_date,"
+                "monday,tuesday,wednesday,thursday,friday,saturday,sunday\n"
+                "svc1,20260101,20261231,1,1,1,1,1,0,0\n",
+            )
+            zf.writestr("calendar_dates.txt", "service_id,date,exception_type\n")
+            zf.writestr(
+                "routes.txt",
+                "route_id,agency_id,route_short_name\nr1,ag1,100\n",
+            )
+            zf.writestr(
+                "trips.txt",
+                "trip_id,route_id,service_id\nt1,r1,svc1\n",
+            )
+            zf.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\nA,Origin,31.89,34.81\n"
+                "B,Trail,31.80,34.85\n",
+            )
+            zf.writestr(
+                "stop_times.txt",
+                "trip_id,stop_id,stop_sequence,arrival_time,departure_time\n"
+                "t1,A,1,07:00:00,07:00:00\n"
+                "t1,B,2,08:00:00,08:00:00\n",
+            )
+
+        # Point GTFS_DIR to tmp_path so the DB lands there
+        from unittest.mock import patch as mpatch
+
+        with mpatch("src.ingest.gtfs.GTFS_DIR", tmp_path):
+            db_path = build_transit_db(gtfs_zip, datetime.date(2026, 2, 3))
+
+        assert db_path.exists()
+
+        # Verify contents
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        trips = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
+        stops = conn.execute("SELECT COUNT(*) FROM stops").fetchone()[0]
+        st = conn.execute("SELECT COUNT(*) FROM stop_times").fetchone()[0]
+        conn.close()
+
+        assert trips == 1
+        assert stops == 2
+        assert st == 2
+
+    def test_inactive_trips_excluded(self, tmp_path):
+        """Trips for inactive services should not appear in the DB."""
+        import zipfile
+
+        gtfs_zip = tmp_path / "test.zip"
+        with zipfile.ZipFile(gtfs_zip, "w") as zf:
+            zf.writestr("agency.txt", "agency_id,agency_name\nag1,Egged\n")
+            # svc1 runs Mon-Fri, svc_inactive runs Sat only
+            zf.writestr(
+                "calendar.txt",
+                "service_id,start_date,end_date,"
+                "monday,tuesday,wednesday,thursday,friday,saturday,sunday\n"
+                "svc1,20260101,20261231,1,1,1,1,1,0,0\n"
+                "svc_sat,20260101,20261231,0,0,0,0,0,1,0\n",
+            )
+            zf.writestr("calendar_dates.txt", "service_id,date,exception_type\n")
+            zf.writestr(
+                "routes.txt",
+                "route_id,agency_id,route_short_name\nr1,ag1,100\nr2,ag1,200\n",
+            )
+            zf.writestr(
+                "trips.txt",
+                "trip_id,route_id,service_id\n"
+                "t_active,r1,svc1\n"
+                "t_sat,r2,svc_sat\n",
+            )
+            zf.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\nA,Stop A,31.89,34.81\n",
+            )
+            zf.writestr(
+                "stop_times.txt",
+                "trip_id,stop_id,stop_sequence,arrival_time,departure_time\n"
+                "t_active,A,1,07:00:00,07:00:00\n"
+                "t_sat,A,1,09:00:00,09:00:00\n",
+            )
+
+        # Query for a Tuesday — only svc1 active
+        from unittest.mock import patch as mpatch
+
+        with mpatch("src.ingest.gtfs.GTFS_DIR", tmp_path):
+            db_path = build_transit_db(gtfs_zip, datetime.date(2026, 2, 3))
+
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        trips = conn.execute("SELECT trip_id FROM trips").fetchall()
+        conn.close()
+
+        trip_ids = [r[0] for r in trips]
+        assert "t_active" in trip_ids
+        assert "t_sat" not in trip_ids
+
+
+class TestFindOriginStopsDB:
+    """Tests for SQLite-based origin stop search."""
+
+    def test_finds_nearby_stop(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        # Rehovot coordinates — stop A is at (31.8928, 34.8113)
+        stops = find_origin_stops_db(db_path, 31.8928, 34.8113, radius_m=500)
+        assert "A" in stops
+
+    def test_excludes_distant_stop(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        # Query far from all stops
+        stops = find_origin_stops_db(db_path, 33.0, 36.0, radius_m=500)
+        assert len(stops) == 0
+
+    def test_sorted_by_distance(self, tmp_path):
+        db_path = _make_transit_db(tmp_path)
+        # Use a wide radius to get multiple stops
+        stops = find_origin_stops_db(db_path, 31.87, 34.82, radius_m=10000)
+        assert len(stops) >= 2
+        # First stop should be closest
+        assert stops[0] in ("A", "B")

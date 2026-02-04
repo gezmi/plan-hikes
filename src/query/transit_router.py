@@ -1,7 +1,10 @@
 """Transit routing engine — finds bus routes between stops using GTFS data.
 
-Builds an in-memory index from a partridge GTFS feed and provides
-forward (outbound) and backward (return) route finding with 0 or 1 transfer.
+Two implementations:
+  - ``TransitRouter``   — in-memory dicts (fast, high memory)
+  - ``TransitRouterDB`` — SQLite on disk   (slower, ~20 MB memory)
+
+Both share the same ``find_outbound`` / ``find_return`` routing algorithm.
 """
 
 from __future__ import annotations
@@ -9,11 +12,15 @@ from __future__ import annotations
 import bisect
 import datetime
 import logging
+import sqlite3
 from collections import defaultdict
+from pathlib import Path
 
 from src.models import BusLeg
 
 logger = logging.getLogger(__name__)
+
+_PROXY_CACHE_MAX = 20_000  # max cached entries per proxy before clearing
 
 # ── Limits for search space pruning ──────────────────────────────────────
 _MAX_INTERMEDIATE_STOPS = 30   # max stops to consider for transfer along a trip
@@ -424,3 +431,139 @@ class TransitRouter:
             self._make_bus_leg(trip_id, f_stop, f_dep, t_stop, t_arr)
             for trip_id, f_stop, f_dep, t_stop, t_arr in best_legs
         ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SQLite-backed proxy dicts
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class _StopDeparturesProxy:
+    """Dict-like object returning stop departures from SQLite.
+
+    ``proxy.get(stop_id)`` returns ``[(dep_secs, trip_id, seq), ...]``
+    sorted by ``dep_secs``, or *None* if no departures exist.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._cache: dict[str, list[tuple[int, str, int]]] = {}
+
+    def get(self, stop_id: str, default=None):
+        if stop_id in self._cache:
+            return self._cache[stop_id] or default
+        rows = self._conn.execute(
+            "SELECT departure_secs, trip_id, stop_sequence "
+            "FROM stop_times WHERE stop_id = ? ORDER BY departure_secs",
+            (stop_id,),
+        ).fetchall()
+        if len(self._cache) > _PROXY_CACHE_MAX:
+            self._cache.clear()
+        self._cache[stop_id] = rows
+        return rows if rows else default
+
+
+class _TripStopSequenceProxy:
+    """Dict-like object returning trip stop sequences from SQLite.
+
+    ``proxy.get(trip_id)`` returns
+    ``[(stop_id, arr_secs, dep_secs, seq), ...]`` sorted by ``seq``,
+    or *None* if no data exists.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._cache: dict[str, list[tuple[str, int, int, int]]] = {}
+
+    def get(self, trip_id: str, default=None):
+        if trip_id in self._cache:
+            return self._cache[trip_id] or default
+        rows = self._conn.execute(
+            "SELECT stop_id, arrival_secs, departure_secs, stop_sequence "
+            "FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence",
+            (trip_id,),
+        ).fetchall()
+        if len(self._cache) > _PROXY_CACHE_MAX:
+            self._cache.clear()
+        self._cache[trip_id] = rows
+        return rows if rows else default
+
+
+class _SingleValueProxy:
+    """Dict-like proxy for simple key→value lookups from SQLite."""
+
+    def __init__(self, conn: sqlite3.Connection, query: str) -> None:
+        self._conn = conn
+        self._query = query
+        self._cache: dict[str, object] = {}
+
+    def get(self, key: str, default=None):
+        if key in self._cache:
+            val = self._cache[key]
+            return val if val is not None else default
+        row = self._conn.execute(self._query, (key,)).fetchone()
+        val = row[0] if row else None
+        if len(self._cache) > _PROXY_CACHE_MAX:
+            self._cache.clear()
+        self._cache[key] = val
+        return val if val is not None else default
+
+
+class _RouteInfoProxy:
+    """Dict-like proxy for route_id → (short_name, agency_name) from SQLite."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._cache: dict[str, tuple[str, str]] = {}
+
+    def get(self, route_id: str, default=None):
+        if route_id in self._cache:
+            return self._cache[route_id]
+        row = self._conn.execute(
+            "SELECT short_name, agency_name FROM routes WHERE route_id = ?",
+            (route_id,),
+        ).fetchone()
+        if row is None:
+            return default
+        val = (row[0], row[1])
+        if len(self._cache) > _PROXY_CACHE_MAX:
+            self._cache.clear()
+        self._cache[route_id] = val
+        return val
+
+
+class TransitRouterDB(TransitRouter):
+    """SQLite-backed transit router — same API as TransitRouter, ~20 MB RAM.
+
+    Inherits the ``find_outbound`` / ``find_return`` routing algorithms
+    from :class:`TransitRouter`. Replaces the in-memory dicts with SQLite
+    proxy objects that query on demand and cache recent results.
+    """
+
+    def __init__(self, db_path: Path, date: datetime.date) -> None:
+        # Deliberately skip TransitRouter.__init__
+        self.date = date
+        self.db_path = db_path
+        self._conn = sqlite3.connect(str(db_path))
+        self._conn.execute("PRAGMA cache_size=-20000")  # 20 MB SQLite cache
+        self._conn.execute("PRAGMA mmap_size=268435456")  # 256 MB mmap
+
+        # Proxy objects — same .get() interface as dicts
+        self.stop_departures = _StopDeparturesProxy(self._conn)
+        self.trip_stop_sequence = _TripStopSequenceProxy(self._conn)
+        self.stop_name = _SingleValueProxy(
+            self._conn, "SELECT stop_name FROM stops WHERE stop_id = ?"
+        )
+        self.trip_route = _SingleValueProxy(
+            self._conn, "SELECT route_id FROM trips WHERE trip_id = ?"
+        )
+        self.route_info = _RouteInfoProxy(self._conn)
+
+        n_trips = self._conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
+        logger.info(
+            "TransitRouterDB opened: %s (%d trips)", db_path.name, n_trips
+        )
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        self._conn.close()

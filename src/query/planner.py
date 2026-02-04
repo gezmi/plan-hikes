@@ -27,12 +27,18 @@ from src.config import (
     THROUGH_HIKE_MIN_DISTANCE_KM,
     WALK_SPEED_KMH,
 )
-from src.ingest.gtfs import download_gtfs, find_origin_stops, load_feed_for_date
+from src.ingest.gtfs import (
+    build_transit_db,
+    download_gtfs,
+    find_origin_stops,
+    find_origin_stops_db,
+    load_feed_for_date,
+)
 from src.ingest.osm_trails import fetch_hiking_trails
 from src.ingest.shabbat import get_deadline
 from src.index.spatial_join import build_trail_access_points
 from src.models import HikePlan, HikeQuery, HikeSegment, Trail, TrailAccessPoint
-from src.query.transit_router import TransitRouter
+from src.query.transit_router import TransitRouter, TransitRouterDB
 
 TRAIL_INDEX_PATH = DATA_DIR / "processed" / "trail_index.json"
 
@@ -42,11 +48,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PlannerContext:
     """Pre-loaded, origin-independent data for planning hikes."""
-    feed: object
+    feed: object  # _FilteredFeed or None (when using SQLite path)
     trails: list[Trail]
     deadline: datetime.datetime
     deadline_secs: int
-    router: TransitRouter
+    router: TransitRouter  # or TransitRouterDB
+    db_path: Path | None = None  # set when using SQLite low-memory path
 
 
 def load_trail_index(path: Path | None = None) -> list[Trail]:
@@ -108,16 +115,37 @@ def load_trail_index(path: Path | None = None) -> list[Trail]:
     return trails
 
 
-def prepare_data_from_index(query: HikeQuery) -> PlannerContext:
+def prepare_data_from_index(
+    query: HikeQuery,
+    *,
+    low_memory: bool = True,
+) -> PlannerContext:
     """Like prepare_data, but loads trails from the pre-processed index.
 
     Skips the Overpass query, elevation enrichment, and spatial join.
-    Still downloads GTFS for transit routing.
+
+    Parameters
+    ----------
+    query : HikeQuery
+        The user query (used for date, filters, etc.).
+    low_memory : bool
+        If *True* (default), stream the GTFS zip into a SQLite database
+        and use :class:`TransitRouterDB` (~20 MB RAM).
+        If *False*, load the full GTFS feed into pandas/partridge
+        (~1-2 GB RAM) for faster routing.
     """
-    # ── Load GTFS (still needed for transit routing) ──────────────────
     gtfs_path = download_gtfs()
-    feed = load_feed_for_date(gtfs_path, query.date)
-    router = TransitRouter(feed, query.date)
+
+    if low_memory:
+        # ── Low-memory path: GTFS CSV → SQLite on disk ───────────────
+        db_path = build_transit_db(gtfs_path, query.date)
+        router = TransitRouterDB(db_path, query.date)
+        feed = None
+    else:
+        # ── High-memory path: partridge → pandas DataFrames ──────────
+        feed = load_feed_for_date(gtfs_path, query.date)
+        router = TransitRouter(feed, query.date)
+        db_path = None
 
     # ── Trails from pre-processed index ───────────────────────────────
     trails = load_trail_index()
@@ -137,6 +165,7 @@ def prepare_data_from_index(query: HikeQuery) -> PlannerContext:
         deadline=deadline,
         deadline_secs=deadline_secs,
         router=router,
+        db_path=db_path,
     )
 
 
@@ -280,7 +309,10 @@ def plan_hikes_for_origin(query: HikeQuery, ctx: PlannerContext) -> list[HikePla
     lat, lon = _resolve_origin(query.origin)
     logger.info("Origin: %s → (%.4f, %.4f)", query.origin, lat, lon)
 
-    origin_stop_ids = find_origin_stops(ctx.feed, lat, lon, STOP_SEARCH_RADIUS_M)
+    if ctx.db_path is not None:
+        origin_stop_ids = find_origin_stops_db(ctx.db_path, lat, lon, STOP_SEARCH_RADIUS_M)
+    else:
+        origin_stop_ids = find_origin_stops(ctx.feed, lat, lon, STOP_SEARCH_RADIUS_M)
     if not origin_stop_ids:
         logger.warning("No bus stops found within %dm of %s", STOP_SEARCH_RADIUS_M, query.origin)
         return []

@@ -3,18 +3,24 @@
 Downloads the Israeli GTFS feed from the Ministry of Transport server,
 loads it with partridge, and provides helpers for filtering by date and
 finding nearby stops.
+
+Two loading paths:
+  - ``load_feed_for_date`` → partridge → pandas DataFrames (high memory)
+  - ``build_transit_db``   → streaming CSV → SQLite on disk (low memory)
 """
 
 from __future__ import annotations
 
+import csv
 import datetime
+import io
 import logging
 import math
+import sqlite3
+import zipfile
 from pathlib import Path
 
-import pandas as pd
-import partridge as ptg
-import requests
+import requests  # noqa: E402 — used by download_gtfs
 
 from src.config import (
     GTFS_CACHE_DAYS,
@@ -153,6 +159,8 @@ def get_active_service_ids(feed, date: datetime.date) -> set[str]:
     set[str]
         Active service IDs.
     """
+    import pandas as pd
+
     date_str = date.strftime("%Y%m%d")
     date_int = int(date_str)  # partridge may parse dates as int
 
@@ -245,6 +253,9 @@ def load_feed_for_date(gtfs_path: Path, date: datetime.date):
         The ``.trips`` and ``.stop_times`` tables are filtered to only
         contain entries for services running on *date*.
     """
+    import pandas as pd
+    import partridge as ptg
+
     logger.info("Loading raw GTFS feed from %s ...", gtfs_path)
     raw = ptg.load_raw_feed(str(gtfs_path))
 
@@ -332,5 +343,284 @@ def find_origin_stops(
         radius_m,
         lat,
         lon,
+    )
+    return stop_ids
+
+
+# ---------------------------------------------------------------------------
+# Low-memory path: stream GTFS CSV → SQLite
+# ---------------------------------------------------------------------------
+
+def _gtfs_time_to_seconds(time_str: str) -> int:
+    """Parse GTFS time "HH:MM:SS" to seconds since midnight (HH may be ≥ 24)."""
+    parts = time_str.strip().split(":")
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+
+def _get_active_service_ids_from_csv(
+    zf: zipfile.ZipFile, date: datetime.date
+) -> set[str]:
+    """Determine active service_ids for *date* by reading calendar CSV files.
+
+    Reads calendar.txt and calendar_dates.txt directly from the zip,
+    without loading into pandas.
+    """
+    date_int = int(date.strftime("%Y%m%d"))
+    day_name = date.strftime("%A").lower()  # "monday" .. "sunday"
+
+    active: set[str] = set()
+
+    # --- calendar.txt ---
+    if "calendar.txt" in zf.namelist():
+        with io.TextIOWrapper(zf.open("calendar.txt"), encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                start = int(str(row["start_date"]).strip())
+                end = int(str(row["end_date"]).strip())
+                if start <= date_int <= end and row.get(day_name, "0").strip() == "1":
+                    active.add(str(row["service_id"]).strip())
+
+    # --- calendar_dates.txt ---
+    if "calendar_dates.txt" in zf.namelist():
+        with io.TextIOWrapper(zf.open("calendar_dates.txt"), encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                row_date = int(str(row["date"]).strip())
+                if row_date != date_int:
+                    continue
+                sid = str(row["service_id"]).strip()
+                exc_type = int(str(row["exception_type"]).strip())
+                if exc_type == 1:
+                    active.add(sid)
+                elif exc_type == 2:
+                    active.discard(sid)
+
+    logger.info("Active service_ids for %s: %d", date.isoformat(), len(active))
+    return active
+
+
+def build_transit_db(gtfs_path: Path, date: datetime.date) -> Path:
+    """Build a date-specific SQLite database by streaming CSV from the GTFS zip.
+
+    Memory usage: ~5-10 MB (active trip_id set + SQLite page cache).
+    The resulting database contains only trips/stop_times active on *date*.
+
+    Parameters
+    ----------
+    gtfs_path : Path
+        Path to the GTFS zip file.
+    date : datetime.date
+        The date to filter for.
+
+    Returns
+    -------
+    Path
+        Path to the SQLite database file.
+    """
+    GTFS_DIR.mkdir(parents=True, exist_ok=True)
+    db_path = GTFS_DIR / f"transit_{date.isoformat()}.db"
+
+    if db_path.exists():
+        logger.info("Transit DB already exists: %s", db_path)
+        return db_path
+
+    logger.info("Building transit SQLite DB for %s from %s ...", date, gtfs_path)
+    tmp_path = db_path.with_suffix(".db.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    conn = sqlite3.connect(str(tmp_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-20000")  # 20 MB page cache
+
+    conn.executescript("""
+        CREATE TABLE stops (
+            stop_id TEXT PRIMARY KEY,
+            stop_name TEXT,
+            stop_lat REAL,
+            stop_lon REAL
+        );
+        CREATE TABLE routes (
+            route_id TEXT PRIMARY KEY,
+            short_name TEXT,
+            agency_name TEXT
+        );
+        CREATE TABLE trips (
+            trip_id TEXT PRIMARY KEY,
+            route_id TEXT
+        );
+        CREATE TABLE stop_times (
+            trip_id TEXT,
+            stop_id TEXT,
+            stop_sequence INTEGER,
+            arrival_secs INTEGER,
+            departure_secs INTEGER
+        );
+    """)
+
+    with zipfile.ZipFile(gtfs_path) as zf:
+        # 1. Determine active services
+        active_service_ids = _get_active_service_ids_from_csv(zf, date)
+        if not active_service_ids:
+            logger.warning("No active services for %s", date)
+
+        # 2. Read agency.txt → agency_id → agency_name
+        agency_names: dict[str, str] = {}
+        if "agency.txt" in zf.namelist():
+            with io.TextIOWrapper(zf.open("agency.txt"), encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    agency_names[str(row["agency_id"]).strip()] = str(
+                        row.get("agency_name", "")
+                    ).strip()
+
+        # 3. Read routes.txt → insert into routes table
+        if "routes.txt" in zf.namelist():
+            with io.TextIOWrapper(zf.open("routes.txt"), encoding="utf-8-sig") as f:
+                batch = []
+                for row in csv.DictReader(f):
+                    route_id = str(row["route_id"]).strip()
+                    short_name = str(row.get("route_short_name", "")).strip()
+                    agency_id = str(row.get("agency_id", "")).strip()
+                    agency_name = agency_names.get(agency_id, "")
+                    batch.append((route_id, short_name, agency_name))
+                    if len(batch) >= 5000:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO routes VALUES (?,?,?)", batch
+                        )
+                        batch.clear()
+                if batch:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO routes VALUES (?,?,?)", batch
+                    )
+            logger.info("Inserted routes")
+
+        # 4. Read trips.txt → filter to active services → insert + collect trip_ids
+        active_trip_ids: set[str] = set()
+        if "trips.txt" in zf.namelist():
+            with io.TextIOWrapper(zf.open("trips.txt"), encoding="utf-8-sig") as f:
+                batch = []
+                for row in csv.DictReader(f):
+                    sid = str(row["service_id"]).strip()
+                    if sid not in active_service_ids:
+                        continue
+                    trip_id = str(row["trip_id"]).strip()
+                    route_id = str(row["route_id"]).strip()
+                    active_trip_ids.add(trip_id)
+                    batch.append((trip_id, route_id))
+                    if len(batch) >= 10000:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO trips VALUES (?,?)", batch
+                        )
+                        batch.clear()
+                if batch:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO trips VALUES (?,?)", batch
+                    )
+            logger.info("Active trips: %d", len(active_trip_ids))
+
+        # 5. Read stops.txt → insert into stops table
+        if "stops.txt" in zf.namelist():
+            with io.TextIOWrapper(zf.open("stops.txt"), encoding="utf-8-sig") as f:
+                batch = []
+                for row in csv.DictReader(f):
+                    stop_id = str(row["stop_id"]).strip()
+                    stop_name = str(row.get("stop_name", "")).strip()
+                    try:
+                        slat = float(row.get("stop_lat", 0))
+                        slon = float(row.get("stop_lon", 0))
+                    except (ValueError, TypeError):
+                        slat, slon = 0.0, 0.0
+                    batch.append((stop_id, stop_name, slat, slon))
+                    if len(batch) >= 10000:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO stops VALUES (?,?,?,?)", batch
+                        )
+                        batch.clear()
+                if batch:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO stops VALUES (?,?,?,?)", batch
+                    )
+            logger.info("Inserted stops")
+
+        # 6. Stream stop_times.txt → only insert rows for active trips
+        if "stop_times.txt" in zf.namelist():
+            with io.TextIOWrapper(
+                zf.open("stop_times.txt"), encoding="utf-8-sig"
+            ) as f:
+                batch = []
+                inserted = 0
+                skipped = 0
+                for row in csv.DictReader(f):
+                    trip_id = str(row["trip_id"]).strip()
+                    if trip_id not in active_trip_ids:
+                        skipped += 1
+                        continue
+                    stop_id = str(row["stop_id"]).strip()
+                    seq = int(row["stop_sequence"])
+                    arr_secs = _gtfs_time_to_seconds(row["arrival_time"])
+                    dep_secs = _gtfs_time_to_seconds(row["departure_time"])
+                    batch.append((trip_id, stop_id, seq, arr_secs, dep_secs))
+                    if len(batch) >= 50000:
+                        conn.executemany(
+                            "INSERT INTO stop_times VALUES (?,?,?,?,?)", batch
+                        )
+                        inserted += len(batch)
+                        batch.clear()
+                if batch:
+                    conn.executemany(
+                        "INSERT INTO stop_times VALUES (?,?,?,?,?)", batch
+                    )
+                    inserted += len(batch)
+            logger.info(
+                "Inserted %d stop_times (skipped %d inactive)", inserted, skipped
+            )
+
+    # 7. Create indices
+    logger.info("Creating indices ...")
+    conn.executescript("""
+        CREATE INDEX idx_st_stop_dep ON stop_times(stop_id, departure_secs);
+        CREATE INDEX idx_st_trip_seq ON stop_times(trip_id, stop_sequence);
+    """)
+    conn.commit()
+    conn.close()
+
+    tmp_path.rename(db_path)
+    size_mb = db_path.stat().st_size / (1024 * 1024)
+    logger.info("Transit DB ready: %s (%.1f MB)", db_path, size_mb)
+    return db_path
+
+
+def find_origin_stops_db(
+    db_path: Path,
+    lat: float,
+    lon: float,
+    radius_m: float = STOP_SEARCH_RADIUS_M,
+) -> list[str]:
+    """Return stop_ids within *radius_m* of (*lat*, *lon*) using SQLite.
+
+    Equivalent to :func:`find_origin_stops` but reads from the transit
+    SQLite database instead of a partridge feed DataFrame.
+    """
+    conn = sqlite3.connect(str(db_path))
+    # Rough bounding box filter (1 degree ≈ 111 km)
+    deg_margin = (radius_m / 111_000) * 1.5
+    rows = conn.execute(
+        "SELECT stop_id, stop_lat, stop_lon FROM stops "
+        "WHERE stop_lat BETWEEN ? AND ? AND stop_lon BETWEEN ? AND ?",
+        (lat - deg_margin, lat + deg_margin, lon - deg_margin, lon + deg_margin),
+    ).fetchall()
+    conn.close()
+
+    results: list[tuple[float, str]] = []
+    for stop_id, slat, slon in rows:
+        dist = haversine(lat, lon, slat, slon)
+        if dist <= radius_m:
+            results.append((dist, stop_id))
+
+    results.sort(key=lambda x: x[0])
+    stop_ids = [sid for _, sid in results]
+
+    logger.info(
+        "Found %d stops within %.0f m of (%.4f, %.4f) [SQLite].",
+        len(stop_ids), radius_m, lat, lon,
     )
     return stop_ids
