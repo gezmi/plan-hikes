@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -24,6 +25,10 @@ from src.query.planner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Absolute paths for static files (works regardless of working directory)
+_WEB_DIR = Path(__file__).resolve().parent
+_STATIC_DIR = _WEB_DIR / "static"
 
 # ── Shared planner context (loaded once at startup) ─────────────────
 _ctx: PlannerContext | None = None
@@ -62,7 +67,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Israel Hiking Transit Planner", version="0.3.0", lifespan=lifespan)
 
 # Serve static files (HTML/JS/CSS)
-app.mount("/static", StaticFiles(directory="web/static"), name="static")
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 # ── Pydantic request/response models ────────────────────────────────
@@ -253,7 +258,7 @@ def _serialize_plan(rank: int, plan: HikePlan, origin_lat: float | None, origin_
 @app.get("/")
 async def root():
     """Serve the main page."""
-    return FileResponse("web/static/index.html")
+    return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
 @app.get("/api/cities")
@@ -288,6 +293,9 @@ async def plan(req: PlanRequest):
         ctx = _get_context(date)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("Failed to load planner context")
+        raise HTTPException(500, f"Data loading failed: {e}")
 
     # Plan for each origin
     results: list[OriginResultOut] = []
@@ -308,7 +316,11 @@ async def plan(req: PlanRequest):
             max_elevation_gain_m=req.max_elevation_gain_m,
         )
 
-        plans = plan_hikes_for_origin(query, ctx)
+        try:
+            plans = plan_hikes_for_origin(query, ctx)
+        except Exception as e:
+            logger.exception("Planning failed for origin %s", origin)
+            raise HTTPException(500, f"Planning failed for {origin}: {e}")
 
         origin_coords = CITY_COORDINATES.get(origin.strip().lower())
         o_lat = origin_coords[0] if origin_coords else None

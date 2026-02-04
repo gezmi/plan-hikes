@@ -64,18 +64,25 @@ function sparkline(values, width) {
 
 // ── Load cities ────────────────────────────────────────────────────
 async function loadCities() {
-  const res = await fetch("/api/cities");
-  const data = await res.json();
-  const select = document.getElementById("origins");
-  data.cities.forEach(city => {
-    const opt = document.createElement("option");
-    opt.value = city.name;
-    opt.textContent = city.name;
-    select.appendChild(opt);
-  });
-  // Pre-select first city
-  if (select.options.length > 0) {
-    select.options[0].selected = true;
+  try {
+    const res = await fetch("/api/cities");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const select = document.getElementById("origins");
+    data.cities.forEach(city => {
+      const opt = document.createElement("option");
+      opt.value = city.name;
+      opt.textContent = city.name;
+      select.appendChild(opt);
+    });
+    // Pre-select first city
+    if (select.options.length > 0) {
+      select.options[0].selected = true;
+    }
+  } catch (err) {
+    console.error("Failed to load cities:", err);
+    document.getElementById("status").textContent = "Failed to load city list. Server may be starting up — try refreshing.";
+    document.getElementById("status").className = "error";
   }
 }
 
@@ -379,8 +386,15 @@ document.getElementById("query-form").addEventListener("submit", async (e) => {
     });
 
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || `HTTP ${res.status}`);
+      let detail = `HTTP ${res.status}`;
+      try {
+        const err = await res.json();
+        detail = err.detail || detail;
+      } catch (_) {
+        // Response body wasn't JSON — use the status text
+        detail = `HTTP ${res.status}: ${res.statusText}`;
+      }
+      throw new Error(detail);
     }
 
     const data = await res.json();
